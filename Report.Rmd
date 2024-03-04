@@ -1,0 +1,292 @@
+---
+title: "STAT218 Final Project"
+output: html_document
+date: "2023-12-12"
+author: "Ben Weisenbeck"
+---
+
+# Predicting Chocolate Chip Cookie Recipe Ratings
+
+```{r libraries, warning=F, message=F, include=F}
+library(tidyverse)
+library(ranger)
+library(caret)
+library(rpart)
+library(rattle)
+```
+
+## Imported Data
+
+We will be using a data set on chocolate chip cookie recipes, found [here](https://www.kaggle.com/datasets/thedevastator/chocolate-chip-cookie-recipes?select=choc_chip_cookie_ingredients.csv). The data contain information on ingredients found in recipes and the rating of recipes. Currently, it is formatted so that each row contains one ingredient, its amount, its unit, and the corresponding recipe index and rating. We will want to wrangle the data so that each row contains one recipe and its corresponding ingredients, but we'll get to that later. 
+
+```{r data}
+cookies = read.csv("choc_chip_cookie_ingredients.csv")
+```
+
+First, let's get rid of some filler columns. Here's a peak at some rows.
+
+```{r clean-data}
+cookies_clean = cookies %>%
+  select(Recipe_Index, Ingredient, Quantity, Unit, Rating)
+cookies_clean %>% head(5)
+```
+
+Just to clarify, for each unique value of `Recipe_Index`, there are multiple rows, each with one ingredient which is used in that recipe. This data set has only about 100 recipes in total, so let's add a few more.
+
+## Webscraping
+
+Let's write a simple web scraper to get recipes from [allrecipes.com](allrecipes.com).
+
+```{r}
+library(rvest)
+```
+
+
+```{r convert-func}
+# Helper function for converting string amounts to numeric
+convert_to_numeric = function(quantity_string) {
+  
+  if (is.na(quantity_string) || quantity_string == "")
+    return(0)
+
+  cleaned_string = str_trim(quantity_string)
+
+  # Replace fractions with decimal points
+  cleaned_string = gsub(" ", "", cleaned_string)  # Remove spaces
+  cleaned_string = gsub("½", ".5", cleaned_string)
+  cleaned_string = gsub("1/2", ".5", cleaned_string)
+  cleaned_string = gsub("¼", ".25", cleaned_string)
+  cleaned_string = gsub("1/4", ".25", cleaned_string)
+  cleaned_string = gsub("¾", ".75", cleaned_string)
+  cleaned_string = gsub("3/4", ".75", cleaned_string)
+  cleaned_string = gsub("⅓", ".33", cleaned_string)
+  cleaned_string = gsub("1/3", ".33", cleaned_string)
+  cleaned_string = gsub("⅔", ".66", cleaned_string)
+  cleaned_string = gsub("2/3", ".66", cleaned_string)
+
+  # Convert the cleaned string to a numeric value
+  numeric_value = as.numeric(cleaned_string)
+  if(is.na(numeric_value)) return(0)
+  return(numeric_value)
+}
+```
+
+
+```{r web-scrape}
+### Web Scraper
+# Data frame to store new data in
+all_recipes = data.frame(Recipe_Index = character(0),
+                     Rating = numeric(0),
+                     Text = character(0),
+                     Quantity = numeric(0), 
+                     Unit = character(0), 
+                     Ingredient = character(0))
+
+# Url leads to allrecipes page with a bunch of chocolate chip cookie recipes
+AR_url = "https://www.allrecipes.com/recipes/839/desserts/cookies/chocolate-chip-cookies/"
+AR_webpage = read_html(AR_url)
+
+# Extract all links to recipes on the page
+recipe_links = AR_webpage %>%
+  html_elements(".card--no-image") %>%
+  html_attr("href")
+
+
+for(link in recipe_links){
+  recipe_page = read_html(link)
+  
+  # Extract rating
+  rating = recipe_page %>%
+    html_element("#mntl-recipe-review-bar__rating_1-0") %>%
+    html_text() %>%
+    as.numeric() * 0.2 #convert from 5 star rating to 0-1 scale
+  
+  # Extract ingredients
+  ingredients = recipe_page %>%
+    html_element("#mntl-structured-ingredients_1-0") %>%
+    html_element("ul") %>%
+    html_elements("li")
+  
+  # Extract ingredient, quantity, and unit for each ingredient
+  for(ingredient in ingredients){
+    children = html_elements(ingredient, "span")
+    if(length(children) >= 3){
+      # Special function for converting string amounts to numeric
+      quantity = convert_to_numeric(html_text(children[1]))
+      unit = html_text(children[2])
+      name = html_text(children[3])
+      
+      # Add data to data frame
+      new_row = data.frame(Recipe_Index = link, 
+                           Rating = rating,
+                           Quantity = quantity, 
+                           Unit = unit, 
+                           Ingredient = name)
+      all_recipes = rbind(all_recipes, new_row)
+    }
+  }
+}
+```
+
+Now, we can combine this data with the data set from kaggle!
+
+```{r combine}
+cookies_combined = rbind(cookies_clean, all_recipes)
+```
+
+This data is quite messy as there are many ingredients, some of which should be named the same, like "all purpose flour" and "all-purpose flour". I am going to vastly oversimplify this data to try to condense the number of ingredients.
+
+I have broken chocolate chip cookies into some main ingredients: flour, sugar, butter, eggs, vanilla, salt, chocolate, and baking soda. Everything else will be tossed into "other." This way, we avoid the case of having a lot of ingredients with only one recipe that uses them.
+
+```{r clean}
+cookies_combined_clean = cookies_combined %>%
+  mutate(Ingredient = case_when(grepl("flour", Ingredient, ignore.case = T) ~ "flour",
+                                grepl("sugar", Ingredient, ignore.case = T) ~ "sugar",
+                                grepl("butter", Ingredient, ignore.case = T) ~ "butter",
+                                grepl("egg", Ingredient, ignore.case = T) ~ "eggs",
+                                grepl("vanilla", Ingredient, ignore.case = T) ~ "vanilla",
+                                grepl("salt", Ingredient, ignore.case = T) ~ "salt",
+                                grepl("chocolate", Ingredient, ignore.case = T) ~ "chocolate",
+                                grepl("baking", Ingredient, ignore.case = T) ~ "baking soda",
+                                T ~ "other"))
+```
+
+
+Now, we need to make sure that each ingredient has one unit. Let's convert everything into cups.
+
+```{r units}
+cookies_combined_clean = cookies_combined_clean %>%
+  mutate(Quantity = case_when((Unit == "teaspoon" | Unit == "teaspoons") ~ Quantity * 0.02,
+                              (Unit == "tablespoon" | Unit == "tablespoons") ~ Quantity * 0.063,
+                              TRUE ~ Quantity)) %>%
+  mutate(Unit = "cup")
+```
+
+
+## Pivoting the Data
+
+Now for the fun part, let's pivot the data so that each row contains data on one recipe, including the amount of each ingredient it uses, and what it was rated. This could help us find the ratios for the perfect chocolate chip cookie.
+
+```{r pivot}
+recipes = cookies_combined_clean %>%
+  pivot_wider(id_cols = c(Recipe_Index, Rating), 
+              names_from = Ingredient, 
+              values_from = Quantity,
+              values_fn = sum,
+              values_fill = 0) %>%
+  mutate(Recipe_Index = row_number()) %>%
+  filter(!is.na(Rating))
+
+colnames(recipes) = make.names(colnames(recipes))
+recipes %>% head(5)
+```
+
+We are finally done with wrangling the data. We are left with a dataset containing about 150 chocolate chip cookie recipes, with their ratings and ingredients. Now we can try to do some analysis.
+
+## Exploratory Analysis
+
+Let's first look at the distribution of ratings.
+
+```{r boxplot}
+recipes %>%
+  ggplot() +
+  geom_boxplot(aes(x=Rating))
+```
+
+The ratings represent a score out of $1$, and range from about $0.4$ to $1$. The mean rating falls around $0.88$, and more than three-quarters of the recipes are rated above $0.8$. Most recipes are rated quite well, which is to be expected, as we'd expect recipes on a recipe site to be tasty. I would love to have more data on recipes that are poorly rated, as this would help distinguish the good from the bad, but unfortunately, poorly rated recipes are hard to find in bulk.
+
+Let's use hierarchical clustering to find any outliers in our data.
+
+```{r hc}
+recipes_dist = dist(scale(recipes %>% select(-Recipe_Index)))
+hc1 = hclust(recipes_dist)
+plot(hc1)
+```
+
+Looks like there are a few outliers on the left. One recipe has a rating of 0.375, which places it far from the mean. The other recipe somehow manages to use no flour. Let's cut the two left outliers out.
+
+```{r outlier}
+cut = cutree(hc1, h = 15)
+recipes = recipes[cut == 1,]
+```
+
+## Predicting Rating
+
+Now, let's say we want to predict Rating using all of the ingredients in a recipe. As this is a regression problem, we will use root mean squared error (RMSE) to measure the accuracy of our models. This metric is calculated by squaring the error for each data point, finding the average of those squared errors, and taking the square root. Since the spread of the ratings is quite low, we will need to have a low RMSE. We will also use the r-squared value, which corresponds to the proportion of the variation in the ratings that is explained by the model. Ideally, we want an r-squared value above $0.5$ in order to convince ourselves that the model is doing well.
+
+First, let's try a random forest.
+
+```{r rf}
+rf1 = train(Rating ~ .-Recipe_Index,
+            data = recipes,
+            method = "ranger",
+            importance = "impurity")
+rf1
+```
+
+Yikes, that's a low r-squared value. Although it looks like the RMSE is low here, since the spread of rating is so narrow, this is only doing slightly better than just guessing the mean every time. In fact, let's see what our RMSE error would be if we guessed the mean every time.
+
+```{r rmse}
+mean_rating = mean(recipes$Rating)
+sqrt(mean((mean_rating - recipes$Rating)**2))
+```
+
+...Yeah, this random forest does barely better than just guessing the mean. That's disappointing. Let's try to improve this accuracy by scaling the recipes. This way, we are dealing with proportions instead of values which are dependent on how many cookies the recipe makes. Since the only consistent ingredient across all our recipes is `chocolate`, let's divide all ingredient amounts by the amount of chocolate used.
+
+```{r scale-recipes}
+recipes_scaled = recipes %>%
+  mutate(across(3:11, ~./chocolate))
+```
+
+```{r rf2}
+rf2 = train(Rating ~ .-Recipe_Index,
+            data = recipes_scaled,
+            method = "ranger",
+            importance = "impurity")
+rf2
+```
+
+This gives us a slight improvement to the r-squared value but not much improvement to the RMSE. As it turns out, predicting recipe ratings like this is quite hard.
+
+Are there other statistical learning methods that would work better for this regression problem? Let's consider a Support Vector Machine with a linear kernel, which will attempt to draw a hyperplane in the "ingredients dimensions" that best defines their relationship with the rating.
+
+```{r svm, warning=F}
+svm1 = train(Rating ~ .-Recipe_Index,
+            data = recipes_scaled,
+            method = "svmLinear")
+svm1
+```
+
+The support vector machine with a linear kernel does even worse than the random forest, which means that the relationship between ingredient amounts and ratings is probably not linear. We can try with a radial kernel.
+
+```{r svm-radial, warning=F}
+svm2 = train(Rating ~ .-Recipe_Index,
+            data = recipes_scaled,
+            method = "svmRadial")
+svm2
+```
+
+The radial kernel does slightly better than the linear kernel, but still worse than the random forest. Just for fun, let's look at the best tree for predicting recipe ratings (without scaling).
+
+```{r tree}
+tree1 = train(Rating ~ .-Recipe_Index,
+            data = recipes,
+            method = "rpart")
+tree1
+```
+
+Horrible r-squared and bad RMSE. What does this top-notch tree look like?
+
+```{r}
+fancyRpartPlot(tree1$finalModel)
+```
+
+That about sums it up.
+
+## Conclusion
+
+This project was basically a lot of wrangling for very little results. My goal to predict chocolate chip recipe ratings based on their ingredients was not quite achieved for many reasons. First of all, acquiring the data is difficult and the resulting data is messy and hard to deal with. I opted to oversimplify the ingredients, which allowed me to eliminate hundreds of ingredients that were used by only one recipe in the data. Secondly, the data did not contain a large enough spread of ratings, meaning we were really only predicting if a recipe is very good or only kind of good. If I was to attempt this project again, I would have tried to find more data on poorly rated recipes (and more data in general).
+
+I went into this project with one question: what makes a good chocolate chip cookie recipe? The answer to my question is really right in front of me - use some variation of the ingredients found in the data in reasonable ranges found in the data and follow the directions, and it will probably turn out great, as long as you aren't too picky. Data scientists should not become bakers. 
+
+
